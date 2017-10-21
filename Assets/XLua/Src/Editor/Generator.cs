@@ -108,7 +108,8 @@ namespace CSObjectWrapEditor
     public static class Generator
     {
         static LuaEnv luaenv = new LuaEnv();
-        static List<string> OpMethodNames = new List<string>() { "op_Addition", "op_Subtraction", "op_Multiply", "op_Division", "op_Equality", "op_UnaryNegation", "op_LessThan", "op_LessThanOrEqual", "op_Modulus" };
+        static List<string> OpMethodNames = new List<string>() { "op_Addition", "op_Subtraction", "op_Multiply", "op_Division", "op_Equality", "op_UnaryNegation", "op_LessThan", "op_LessThanOrEqual", "op_Modulus",
+            "op_BitwiseAnd", "op_BitwiseOr", "op_ExclusiveOr", "op_OnesComplement", "op_LeftShift", "op_RightShift"};
         private static XLuaTemplates templateRef;
 
         static Generator()
@@ -184,17 +185,17 @@ namespace CSObjectWrapEditor
 
                 type_has_extension_methods = from type in gen_types
                                              where type.GetMethods(BindingFlags.Static | BindingFlags.Public)
-                                                    .Any(method => Utils.IsSupportedExtensionMethod(method))
+                                                    .Any(method => method.IsDefined(typeof(ExtensionAttribute), false))
                                              select type;
             }
             return from type in type_has_extension_methods
                    where type.IsSealed && !type.IsGenericType && !type.IsNested
                         from method in type.GetMethods(BindingFlags.Static | BindingFlags.Public)
-                        where IsSupportedExtensionMethod(method, extendedType)
+                        where isSupportedExtensionMethod(method, extendedType)
                         select method;
         }
 
-        public static bool IsSupportedExtensionMethod(MethodBase method, Type extendedType)
+        static bool isSupportedExtensionMethod(MethodBase method, Type extendedType)
         {
             if (!method.IsDefined(typeof(ExtensionAttribute), false))
                 return false;
@@ -211,8 +212,17 @@ namespace CSObjectWrapEditor
                     if (parameterType.IsGenericParameter)
                     {
                         var parameterConstraints = parameterType.GetGenericParameterConstraints();
-                        if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsAssignableFrom(extendedType))
-                            return false;
+                        if (parameterConstraints.Length == 0) return false;
+                        bool firstParamMatch = false;
+                        foreach (var parameterConstraint in parameterConstraints)
+                        {
+                            if (parameterConstraint != typeof(ValueType) && parameterConstraint.IsAssignableFrom(extendedType))
+                            {
+                                firstParamMatch = true;
+                            }
+                        }
+                        if (!firstParamMatch) return false;
+
                         hasValidGenericParameter = true;
                     }
                     else if (parameterType != extendedType)
@@ -221,12 +231,21 @@ namespace CSObjectWrapEditor
                 else if (parameterType.IsGenericParameter)
                 {
                     var parameterConstraints = parameterType.GetGenericParameterConstraints();
-                    if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsClass())
-                        return false;
+                    if (parameterConstraints.Length == 0) return false;
+                    foreach (var parameterConstraint in parameterConstraints)
+                    {
+                        if (!parameterConstraint.IsClass || (parameterConstraint == typeof(ValueType)) || Generator.hasGenericParameter(parameterConstraint))
+                            return false;
+                    }
                     hasValidGenericParameter = true;
                 }
             }
             return hasValidGenericParameter || !method.ContainsGenericParameters;
+        }
+
+        static bool IsDoNotGen(Type type, string name)
+        {
+            return DoNotGen.ContainsKey(type) && DoNotGen[type].Contains(name);
         }
 
         static void getClassInfo(Type type, LuaTable parameters)
@@ -296,6 +315,7 @@ namespace CSObjectWrapEditor
                 .Where(method => !method.IsDefined(typeof (ExtensionAttribute), false) || method.DeclaringType != type)
                 .Where(method => methodNames.ContainsKey(method.Name)) //GenericMethod can not be invoke becuase not static info available!
                 .Concat(extension_methods)
+                .Where(method => !IsDoNotGen(type, method.Name))
                 .Where(method => !isMethodInBlackList(method) && (!method.IsGenericMethod || extension_methods.Contains(method) || isSupportedGenericMethod(method)) && !isObsolete(method) && !method.Name.StartsWith("op_") && !method.Name.StartsWith("add_") && !method.Name.StartsWith("remove_"))
                 .GroupBy(method => (method.Name + ((method.IsStatic && !method.IsDefined(typeof (ExtensionAttribute), false)) ? "_xlua_st_" : "")), (k, v) =>
                 {
@@ -338,7 +358,7 @@ namespace CSObjectWrapEditor
                     type.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
                     .Where(field => !isObsolete(field) && !isMemberInBlackList(field))
                     .Select(field => new { field.Name, field.IsStatic, ReadOnly = field.IsInitOnly || field.IsLiteral, Type = field.FieldType })
-                )/*.Where(getter => !typeof(Delegate).IsAssignableFrom(getter.Type))*/.ToList());
+                ).Where(info => !IsDoNotGen(type, info.Name))/*.Where(getter => !typeof(Delegate).IsAssignableFrom(getter.Type))*/.ToList());
 
             parameters.Set("setters", type.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
                 .Where(prop => prop.CanWrite && (prop.GetSetMethod() != null) && prop.Name != "Item" && !isObsolete(prop) && !isMemberInBlackList(prop)).Select(prop => new { prop.Name, IsStatic = prop.GetSetMethod().IsStatic, Type = prop.PropertyType, IsProperty = true })
@@ -346,7 +366,7 @@ namespace CSObjectWrapEditor
                     type.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
                     .Where(field => !isObsolete(field) && !isMemberInBlackList(field) && !field.IsInitOnly && !field.IsLiteral)
                     .Select(field => new { field.Name, field.IsStatic, Type = field.FieldType, IsProperty = false })
-                )/*.Where(setter => !typeof(Delegate).IsAssignableFrom(setter.Type))*/.ToList());
+                ).Where(info => !IsDoNotGen(type, info.Name))/*.Where(setter => !typeof(Delegate).IsAssignableFrom(setter.Type))*/.ToList());
 
             parameters.Set("operators", type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
                 .Where(method => OpMethodNames.Contains(method.Name))
@@ -357,46 +377,118 @@ namespace CSObjectWrapEditor
                 .ToList());
 
             parameters.Set("newindexers", type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
-                .Where(method => method.Name == "set_Item" && method.GetParameters().Length == 2)
+                .Where(method => method.Name == "set_Item" && method.GetParameters().Length == 2 && !method.GetParameters()[0].ParameterType.IsAssignableFrom(typeof(string)))
                 .ToList());
 
             parameters.Set("events", type.GetEvents(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly).Where(e => !isObsolete(e) && !isMemberInBlackList(e))
                 .Where(ev=> ev.GetAddMethod() != null || ev.GetRemoveMethod() != null)
+                .Where(ev => !IsDoNotGen(type, ev.Name))
                 .Select(ev => new { IsStatic = ev.GetAddMethod() != null? ev.GetAddMethod().IsStatic: ev.GetRemoveMethod().IsStatic, ev.Name,
                     CanSet = false, CanAdd = ev.GetRemoveMethod() != null, CanRemove = ev.GetRemoveMethod() != null, Type = ev.EventHandlerType})
                 .ToList());
+            List<LazyMemberInfo> lazyMemberInfos = new List<LazyMemberInfo>();
+            parameters.Set("lazymembers", lazyMemberInfos);
+            foreach (var member in type.GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
+                .Where(m => IsDoNotGen(type, m.Name))
+                .GroupBy(m=>m.Name).Select(g => g.First())
+                )
+            {
+                switch(member.MemberType)
+                {
+                    case MemberTypes.Method:
+                        MethodBase mb = member as MethodBase;
+                        lazyMemberInfos.Add(new LazyMemberInfo
+                        {
+                            Index = mb.IsStatic ? "CLS_IDX" : "METHOD_IDX",
+                            Name = member.Name,
+                            MemberType = "LazyMemberTypes.Method",
+                            IsStatic = mb.IsStatic ? "true" : "false"
+                        });
+                        break;
+                    case MemberTypes.Event:
+                        EventInfo ev = member as EventInfo;
+                        if (ev.GetAddMethod() == null && ev.GetRemoveMethod() == null) break;
+                        bool eventIsStatic = ev.GetAddMethod() != null ? ev.GetAddMethod().IsStatic : ev.GetRemoveMethod().IsStatic;
+                        lazyMemberInfos.Add(new LazyMemberInfo {
+                            Index = eventIsStatic ? "CLS_IDX" : "METHOD_IDX",
+                            Name = member.Name,
+                            MemberType = "LazyMemberTypes.Event",
+                            IsStatic = eventIsStatic ? "true" : "false"
+                        });
+                        break;
+                    case MemberTypes.Field:
+                        FieldInfo field = member as FieldInfo;
+                        lazyMemberInfos.Add(new LazyMemberInfo
+                        {
+                            Index = field.IsStatic ? "CLS_GETTER_IDX" : "GETTER_IDX",
+                            Name = member.Name,
+                            MemberType = "LazyMemberTypes.FieldGet",
+                            IsStatic = field.IsStatic ? "true" : "false"
+                        });
+                        lazyMemberInfos.Add(new LazyMemberInfo
+                        {
+                            Index = field.IsStatic ? "CLS_SETTER_IDX" : "SETTER_IDX",
+                            Name = member.Name,
+                            MemberType = "LazyMemberTypes.FieldSet",
+                            IsStatic = field.IsStatic ? "true" : "false"
+                        });
+                        break;
+                    case MemberTypes.Property:
+                        PropertyInfo prop = member as PropertyInfo;
+                        if (prop.Name != "Item" || prop.GetIndexParameters().Length == 0)
+                        {
+                            if (prop.CanRead && prop.GetGetMethod() != null)
+                            {
+                                var isStatic = prop.GetGetMethod().IsStatic;
+                                lazyMemberInfos.Add(new LazyMemberInfo
+                                {
+                                    Index = isStatic ? "CLS_GETTER_IDX" : "GETTER_IDX",
+                                    Name = member.Name,
+                                    MemberType = "LazyMemberTypes.PropertyGet",
+                                    IsStatic = isStatic ? "true" : "false"
+                                });
+                            }
+                            if (prop.CanWrite && prop.GetSetMethod() != null)
+                            {
+                                var isStatic = prop.GetSetMethod().IsStatic;
+                                lazyMemberInfos.Add(new LazyMemberInfo
+                                {
+                                    Index = isStatic ? "CLS_SETTER_IDX" : "SETTER_IDX",
+                                    Name = member.Name,
+                                    MemberType = "LazyMemberTypes.PropertySet",
+                                    IsStatic = isStatic ? "true" : "false"
+                                });
+                            }
+                        }
+                        break;
+                }
+            }
+        }
+
+        class LazyMemberInfo
+        {
+            public string Index;
+            public string Name;
+            public string MemberType;
+            public string IsStatic;
         }
 
         static void getInterfaceInfo(Type type, LuaTable parameters)
         {
             parameters.Set("type", type);
 
-            var getters = type.GetProperties().Where(prop => prop.CanRead);
-            var setters = type.GetProperties().Where(prop => prop.CanWrite);
-
-            List<string> methodNames = type.GetMethods(BindingFlags.Public | BindingFlags.Instance
-                | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly).Select(method => method.Name).ToList();
-            foreach (var getter in getters)
-            {
-                methodNames.Remove("get_" + getter.Name);
-            }
-
-            foreach (var setter in setters)
-            {
-                methodNames.Remove("set_" + setter.Name);
-            }
-
-            parameters.Set("methods", type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
-                .Where(method => methodNames.Contains(method.Name) && !method.IsGenericMethod && !method.Name.StartsWith("op_") && !method.Name.StartsWith("add_") && !method.Name.StartsWith("remove_")) //GenericMethod can not be invoke becuase not static info available!
+            var itfs = new Type[] { type }.Concat(type.GetInterfaces());
+            parameters.Set("methods", itfs.SelectMany(i => i.GetMethods())
+                .Where(method => !method.IsSpecialName && !method.IsGenericMethod && !method.Name.StartsWith("op_") && !method.Name.StartsWith("add_") && !method.Name.StartsWith("remove_")) //GenericMethod can not be invoke becuase not static info available!
                     .ToList());
 
-            parameters.Set("propertys", type.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
+            parameters.Set("propertys", itfs.SelectMany(i => i.GetProperties())
                 .Where(prop => (prop.CanRead || prop.CanWrite) && prop.Name != "Item")
                     .ToList());
 
-            parameters.Set("events", type.GetEvents(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly).ToList());
+            parameters.Set("events", itfs.SelectMany(i => i.GetEvents()).ToList());
 
-            parameters.Set("indexers", type.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.IgnoreCase | BindingFlags.DeclaredOnly)
+            parameters.Set("indexers", itfs.SelectMany(i => i.GetProperties())
                 .Where(prop => (prop.CanRead || prop.CanWrite) && prop.Name == "Item")
                     .ToList());
         }
@@ -845,11 +937,17 @@ namespace CSObjectWrapEditor
         {
             string filePath = save_path + "WrapPusher.cs";
             StreamWriter textWriter = new StreamWriter(filePath, false, Encoding.UTF8);
+            var emptyMap = new Dictionary<Type, Type>();
             GenOne(typeof(ObjectTranslator), (type, type_info) =>
             {
                 type_info.Set("purevaluetypes", types
                      .Where(t => t.IsEnum || (!t.IsPrimitive && SizeOf(t) != -1))
-                     .Select(t => new { Type = t, Size = SizeOf(t) }).ToList());
+                     .Select(t => new {
+                         Type = t,
+                         Size = SizeOf(t),
+                         Flag = t.IsEnum ? OptimizeFlag.Default : OptimizeCfg[t],
+                         FieldInfos = (t.IsEnum || OptimizeCfg[t] == OptimizeFlag.Default) ? null : getXluaTypeInfo(t, emptyMap).FieldInfos
+                     }).ToList());
                 type_info.Set("tableoptimzetypes", types.Where(t => !t.IsEnum && SizeOf(t) == -1)
                      .Select(t => new { Type = t, Fields = t.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly) })
                      .ToList());
@@ -954,14 +1052,31 @@ namespace CSObjectWrapEditor
         {
             var enum_types = LuaCallCSharp.Where(type => type.IsEnum).Distinct();
 
-#if XLUA_GENERAL
-            //TODO: 后续支持位运算重载后，这块可以去掉
-            luaenv.Global.Set("g_enum_get_fields_flag", BindingFlags.Static | BindingFlags.Public);
-#endif
             GenEnumWrap(enum_types, GeneratorConfig.common_path);
-#if XLUA_GENERAL
-            luaenv.Global.Set("g_enum_get_fields_flag", (object)null);
-#endif
+        }
+
+        static MethodInfo makeGenericMethodIfNeeded(MethodInfo method)
+        {
+            if (!method.ContainsGenericParameters) return method;
+
+            var genericArguments = method.GetGenericArguments();
+            var constraintedArgumentTypes = new Type[genericArguments.Length];
+            for (var i = 0; i < genericArguments.Length; i++)
+            {
+                var argumentType = genericArguments[i];
+                var parameterConstraints = argumentType.GetGenericParameterConstraints();
+                Type parameterConstraint = parameterConstraints[0];
+                foreach(var type in argumentType.GetGenericParameterConstraints())
+                {
+                    if (parameterConstraint.IsAssignableFrom(type))
+                    {
+                        parameterConstraint = type;
+                    }
+                }
+                
+                constraintedArgumentTypes[i] = parameterConstraint;
+            }
+            return method.MakeGenericMethod(constraintedArgumentTypes);
         }
 
         public static void GenLuaRegister(bool minimum = false)
@@ -975,8 +1090,9 @@ namespace CSObjectWrapEditor
             var extension_methods = from t in ReflectionUse
                                     where t.IsDefined(typeof(ExtensionAttribute), false)
                                     from method in t.GetMethods(BindingFlags.Static | BindingFlags.Public)
-                                    where !method.ContainsGenericParameters && method.IsDefined(typeof(ExtensionAttribute), false)
-                                    select method;
+                                    where method.IsDefined(typeof(ExtensionAttribute), false)
+                                    where !method.ContainsGenericParameters || isSupportedGenericMethod(method)
+                                    select makeGenericMethodIfNeeded(method);
             GenOne(typeof(DelegateBridgeBase), (type, type_info) =>
             {
 #if GENERIC_SHARING
@@ -1037,6 +1153,58 @@ namespace CSObjectWrapEditor
             public int Size;
         }
 
+        class XluaTypeInfo
+        {
+            public Type Type;
+            public List<XluaFieldInfo> FieldInfos;
+            public List<List<XluaFieldInfo>> FieldGroup;
+            public bool IsRoot;
+        }
+
+        static XluaTypeInfo getXluaTypeInfo(Type t, Dictionary<Type, Type> set)
+        {
+            var fs = t.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                        .Select(fi => new XluaFieldInfo { Name = fi.Name, Type = fi.FieldType, IsField = true, Size = SizeOf(fi.FieldType) })
+                        .Concat(t.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                        .Where(prop => {
+                            return (AdditionalProperties.ContainsKey(t) && AdditionalProperties[t].Contains(prop.Name))
+                                || prop.IsDefined(typeof(AdditionalPropertiesAttribute), false);
+                        })
+                        .Select(prop => new XluaFieldInfo { Name = prop.Name, Type = prop.PropertyType, IsField = false, Size = SizeOf(prop.PropertyType) }));
+            int float_field_count = 0;
+            bool only_float = true;
+            foreach (var f in fs)
+            {
+                if (f.Type == typeof(float))
+                {
+                    float_field_count++;
+                }
+                else
+                {
+                    only_float = false;
+                    break;
+                }
+            }
+            List<List<XluaFieldInfo>> grouped_field = null;
+            if (only_float && float_field_count > 1)
+            {
+                grouped_field = new List<List<XluaFieldInfo>>();
+                List<XluaFieldInfo> group = null;
+                foreach (var f in fs)
+                {
+                    if (group == null) group = new List<XluaFieldInfo>();
+                    group.Add(f);
+                    if (group.Count >= 6)
+                    {
+                        grouped_field.Add(group);
+                        group = null;
+                    }
+                }
+                if (group != null) grouped_field.Add(group);
+            }
+            return new XluaTypeInfo { Type = t, FieldInfos = fs.ToList(), FieldGroup = grouped_field, IsRoot = set.ContainsKey(t) };
+        }
+
         public static void GenPackUnpack(IEnumerable<Type> types, string save_path)
         {
             var set = types.ToDictionary(type => type);
@@ -1054,49 +1222,7 @@ namespace CSObjectWrapEditor
             StreamWriter textWriter = new StreamWriter(filePath, false, Encoding.UTF8);
             GenOne(typeof(CopyByValue), (type, type_info) =>
             {
-                type_info.Set("type_infos", all_types.Distinct().Select(t =>
-                {
-                    var fs = t.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                        .Select(fi => new XluaFieldInfo { Name = fi.Name, Type = fi.FieldType, IsField = true, Size = SizeOf(fi.FieldType) })
-                        .Concat(t.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                        .Where(prop => {
-                            return (AdditionalProperties.ContainsKey(t) && AdditionalProperties[t].Contains(prop.Name))
-                                || prop.IsDefined(typeof(AdditionalPropertiesAttribute), false);
-                        })
-                        .Select(prop=> new XluaFieldInfo { Name = prop.Name, Type = prop.PropertyType, IsField = false, Size = SizeOf(prop.PropertyType) }));
-                    int float_field_count = 0;
-                    bool only_float = true;
-                    foreach (var f in fs)
-                    {
-                        if (f.Type == typeof(float))
-                        {
-                            float_field_count++;
-                        }
-                        else
-                        {
-                            only_float = false;
-                            break;
-                        }
-                    }
-                    List<List<XluaFieldInfo>> grouped_field = null;
-                    if (only_float && float_field_count > 1)
-                    {
-                        grouped_field = new List<List<XluaFieldInfo>>();
-                        List<XluaFieldInfo> group = null;
-                        foreach (var f in fs)
-                        {
-                            if (group == null) group = new List<XluaFieldInfo>();
-                            group.Add(f);
-                            if (group.Count >= 6)
-                            {
-                                grouped_field.Add(group);
-                                group = null;
-                            }
-                        }
-                        if (group != null) grouped_field.Add(group);
-                    }
-                    return new { Type = t, FieldInfos = fs.ToList(), FieldGroup = grouped_field, IsRoot = set.ContainsKey(t) };
-                }).ToList());
+                type_info.Set("type_infos", all_types.Distinct().Select(t => getXluaTypeInfo(t, set)).ToList());
             }, templateRef.PackUnpack, textWriter);
             textWriter.Close();
         }
@@ -1118,7 +1244,11 @@ namespace CSObjectWrapEditor
 
         public static Dictionary<Type, HotfixFlag> HotfixCfg = null;
 
-        static void AddToList(List<Type> list, Func<object> get, Type attr)
+        public static Dictionary<Type, OptimizeFlag> OptimizeCfg = null;
+
+        public static Dictionary<Type, HashSet<string>> DoNotGen = null;
+
+        static void AddToList(List<Type> list, Func<object> get, object attr)
         {
             object obj = get();
             if (obj is Type)
@@ -1131,7 +1261,22 @@ namespace CSObjectWrapEditor
             }
             else
             {
-                throw new InvalidOperationException("Only field/property with the type IEnumerable<Type> can be marked " + attr.Name);
+                throw new InvalidOperationException("Only field/property with the type IEnumerable<Type> can be marked " + attr.GetType().Name);
+            }
+            if (attr is GCOptimizeAttribute)
+            {
+                var flag = (attr as GCOptimizeAttribute).Flag;
+                if (obj is Type)
+                {
+                    OptimizeCfg.Add(obj as Type, flag);
+                }
+                else if (obj is IEnumerable<Type>)
+                {
+                    foreach(var type in (obj as IEnumerable<Type>))
+                    {
+                        OptimizeCfg.Add(type, flag);
+                    }
+                }
             }
         }
 
@@ -1139,24 +1284,26 @@ namespace CSObjectWrapEditor
         {
             if (test.IsDefined(typeof(LuaCallCSharpAttribute), false))
             {
-                AddToList(LuaCallCSharp, get_cfg, typeof(LuaCallCSharpAttribute));
                 object[] ccla = test.GetCustomAttributes(typeof(LuaCallCSharpAttribute), false);
+                AddToList(LuaCallCSharp, get_cfg, ccla[0]);
+#pragma warning disable 618
                 if (ccla.Length == 1 && (((ccla[0] as LuaCallCSharpAttribute).Flag & GenFlag.GCOptimize) != 0))
+#pragma warning restore 618
                 {
-                    AddToList(GCOptimizeList, get_cfg, typeof(LuaCallCSharpAttribute));
+                    AddToList(GCOptimizeList, get_cfg, ccla[0]);
                 }
             }
             if (test.IsDefined(typeof(CSharpCallLuaAttribute), false))
             {
-                AddToList(CSharpCallLua, get_cfg, typeof(CSharpCallLuaAttribute));
+                AddToList(CSharpCallLua, get_cfg, test.GetCustomAttributes(typeof(CSharpCallLuaAttribute), false)[0]);
             }
             if (test.IsDefined(typeof(GCOptimizeAttribute), false))
             {
-                AddToList(GCOptimizeList, get_cfg, typeof(GCOptimizeAttribute));
+                AddToList(GCOptimizeList, get_cfg, test.GetCustomAttributes(typeof(GCOptimizeAttribute), false)[0]);
             }
             if (test.IsDefined(typeof(ReflectionUseAttribute), false))
             {
-                AddToList(ReflectionUse, get_cfg, typeof(ReflectionUseAttribute));
+                AddToList(ReflectionUse, get_cfg, test.GetCustomAttributes(typeof(ReflectionUseAttribute), false)[0]);
             }
             if (test.IsDefined(typeof(HotfixAttribute), false))
             {
@@ -1195,6 +1342,22 @@ namespace CSObjectWrapEditor
                     }
                 }
             }
+
+            if (test.IsDefined(typeof(DoNotGenAttribute), false)
+                        && (typeof(Dictionary<Type, List<string>>)).IsAssignableFrom(cfg_type))
+            {
+                var cfg = get_cfg() as Dictionary<Type, List<string>>;
+                foreach (var kv in cfg)
+                {
+                    HashSet<string> set;
+                    if (!DoNotGen.TryGetValue(kv.Key, out set))
+                    {
+                        set = new HashSet<string>();
+                        DoNotGen.Add(kv.Key, set);
+                    }
+                    set.UnionWith(kv.Value);
+                }
+            }
         }
 
         public static void GetGenConfig(IEnumerable<Type> check_types)
@@ -1214,6 +1377,10 @@ namespace CSObjectWrapEditor
             };
 
             HotfixCfg = new Dictionary<Type, HotfixFlag>();
+
+            OptimizeCfg = new Dictionary<Type, OptimizeFlag>();
+
+            DoNotGen = new Dictionary<Type, HashSet<string>>();
 
             foreach (var t in check_types)
             {
@@ -1420,6 +1587,10 @@ namespace CSObjectWrapEditor
                 {
                     Debug.LogError("gen file fail! template=" + template_src + ", err=" + e.Message + ", stack=" + e.StackTrace);
                 }
+                finally
+                {
+                    gen_task.Output.Close();
+                }
             }
         }
 
@@ -1430,42 +1601,37 @@ namespace CSObjectWrapEditor
             if (!method.ContainsGenericParameters)
                 return true;
             var methodParameters = method.GetParameters();
-            var hasValidGenericParameter = false;
+            var hasGenericParameter = false;
             for (var i = 0; i < methodParameters.Length; i++)
             {
                 var parameterType = methodParameters[i].ParameterType;
                 if (parameterType.IsGenericParameter)
                 {
                     var parameterConstraints = parameterType.GetGenericParameterConstraints();
-                    if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsClass || (parameterConstraints[0] == typeof(ValueType)) || hasGenericParameter(parameterConstraints[0]))
-                        return false;
-                    hasValidGenericParameter = true;
+                    if (parameterConstraints.Length == 0) return false;
+                    foreach (var parameterConstraint in parameterConstraints)
+                    {
+                        if (!parameterConstraint.IsClass || (parameterConstraint == typeof(ValueType)) || Generator.hasGenericParameter(parameterConstraint))
+                            return false;
+                    }
+                    hasGenericParameter = true;
                 }
             }
-            return hasValidGenericParameter;
+            return hasGenericParameter;
         }
 
 #if !XLUA_GENERAL
-        [InitializeOnLoad]
-        public class Startup
+        [UnityEditor.Callbacks.PostProcessScene]
+        public static void CheckGenrate()
         {
-
-            static Startup()
+            if (EditorApplication.isCompiling || Application.isPlaying)
             {
-                EditorApplication.update += Update;
+                return;
             }
-
-
-            static void Update()
+            if (!DelegateBridge.Gen_Flag)
             {
-                EditorApplication.update -= Update;
-
-                if (!System.IO.File.Exists(GeneratorConfig.common_path + "XLuaGenAutoRegister.cs"))
-                {
-                    UnityEngine.Debug.LogWarning("code has not been genrate, may be not work in phone!");
-                }
+                throw new InvalidOperationException("Code has not been genrated, may be not work in phone!");
             }
-
         }
 #endif
     }
